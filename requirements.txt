@@ -1,0 +1,5 @@
+# zibllCrawler 直接依赖
+# 由 scripts/scan_imports.py 扫描项目源码后人工审定，仅保留实际被导入使用的包。
+requests==2.34.2
+PyYAML==6.0.3
+cryptography==44.0.0
