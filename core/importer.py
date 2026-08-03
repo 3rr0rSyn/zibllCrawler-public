@@ -16,6 +16,8 @@ import time
 from argparse import Namespace
 from typing import List, Optional, Tuple
 
+import requests
+
 from adapters.captcha_solver import SliderCaptchaSolver
 from adapters.factory import create_login_adapter
 from adapters.site_detector import SiteDetector
@@ -278,14 +280,34 @@ class Importer:
     # ------------------------------------------------------------------
 
     def import_account_interactive(self) -> None:
-        """交互式导入账号。"""
+        """交互式导入账号，支持仅使用 Cookie 登录。"""
         print("\n--- 导入账号 ---")
         try:
             username = sanitize_username(self._input_with_timeout("用户名: "))
-            password = self._input_with_timeout("密码: ")
-            password = sanitize_password(password)
         except ValidationError as exc:
             print(f"输入校验失败: {exc.message}")
+            return
+
+        password = self._input_with_timeout("密码（若使用 Cookie 登录可留空）: ").strip()
+        if password:
+            try:
+                password = sanitize_password(password)
+            except ValidationError as exc:
+                print(f"输入校验失败: {exc.message}")
+                return
+        else:
+            password = ""
+
+        try:
+            cookie = self._sanitize_cookie(
+                self._input_with_timeout("Cookie（从浏览器复制，留空表示使用密码登录）: ")
+            )
+        except ValidationError as exc:
+            print(f"输入校验失败: {exc.message}")
+            return
+
+        if not password and not cookie:
+            print("密码和 Cookie 不能同时为空")
             return
 
         site_raw = self._input_with_timeout("绑定网站 URL 或域名: ").strip()
@@ -300,12 +322,25 @@ class Importer:
             print(f"网站不存在: {site_url}")
             return
 
-        # 登录测试
-        login_ok, login_msg = self._test_login(site["url"], username, password)
-        if not login_ok:
-            print(f"登录测试失败: {login_msg}")
-            return
-        print(f"登录测试通过: {login_msg}")
+        # 优先校验 Cookie
+        if cookie:
+            cookie_ok, cookie_msg = self._validate_cookie(site["url"], username, cookie)
+            if cookie_ok:
+                print(f"Cookie 有效: {cookie_msg}")
+            else:
+                print(f"Cookie 无效: {cookie_msg}")
+                if not password:
+                    print("未提供密码且 Cookie 无效，无法导入")
+                    return
+                print("Cookie 无效，将使用密码登录测试")
+
+        # 密码登录测试
+        if password:
+            login_ok, login_msg = self._test_login(site["url"], username, password)
+            if not login_ok:
+                print(f"登录测试失败: {login_msg}")
+                return
+            print(f"登录测试通过: {login_msg}")
 
         # 列出任务
         tasks = self._list_tasks()
@@ -337,19 +372,29 @@ class Importer:
             password=password,
             site_id=site["id"],
             task_id=task["id"],
+            cookie=cookie or None,
             schedule_type=schedule_type,
             schedule_value=schedule_value,
         )
         print(msg)
 
     def import_account_noninteractive(self, args: Namespace) -> None:
-        """非交互式导入账号。"""
+        """非交互式导入账号，支持仅使用 Cookie 登录。"""
         try:
             username = sanitize_username(args.account_username)
-            password = sanitize_password(args.account_password)
+            password = sanitize_password(args.account_password) if args.account_password else ""
             site_url = sanitize_url(args.account_site)
         except ValidationError as exc:
             logger.error(f"参数校验失败: {exc}")
+            return
+
+        try:
+            cookie = self._sanitize_cookie(args.account_cookie or "")
+        except ValidationError as exc:
+            logger.error(f"参数校验失败: {exc}")
+            return
+        if not password and not cookie:
+            logger.error("密码和 Cookie 不能同时为空")
             return
 
         site = self._find_website(site_url)
@@ -357,11 +402,24 @@ class Importer:
             logger.error(f"网站不存在: {site_url}")
             return
 
-        login_ok, login_msg = self._test_login(site["url"], username, password)
-        if not login_ok:
-            logger.error(f"登录测试失败: {login_msg}")
-            return
-        logger.info(f"登录测试通过: {login_msg}")
+        # 优先校验 Cookie
+        if cookie:
+            cookie_ok, cookie_msg = self._validate_cookie(site["url"], username, cookie)
+            if cookie_ok:
+                logger.info(f"Cookie 有效: {cookie_msg}")
+            else:
+                if not password:
+                    logger.error(f"Cookie 无效且未提供密码: {cookie_msg}")
+                    return
+                logger.warning(f"Cookie 无效，将使用密码登录测试: {cookie_msg}")
+
+        # 密码登录测试
+        if password:
+            login_ok, login_msg = self._test_login(site["url"], username, password)
+            if not login_ok:
+                logger.error(f"登录测试失败: {login_msg}")
+                return
+            logger.info(f"登录测试通过: {login_msg}")
 
         task = self._find_task(args.account_task)
         if not task:
@@ -376,6 +434,7 @@ class Importer:
             password=password,
             site_id=site["id"],
             task_id=task["id"],
+            cookie=cookie or None,
             schedule_type=schedule_type,
             schedule_value=schedule_value,
         )
@@ -387,6 +446,7 @@ class Importer:
         password: str,
         site_id: int,
         task_id: int,
+        cookie: Optional[str] = None,
         schedule_type: str = "now",
         schedule_value: Optional[str] = None,
     ) -> Tuple[bool, str]:
@@ -400,9 +460,17 @@ class Importer:
                 "INSERT OR IGNORE INTO accounts (username, password) VALUES (?, ?)",
                 (username, encrypted_password),
             )
-            account_id = conn.execute(
-                "SELECT id FROM accounts WHERE username = ?", (username,)
-            ).fetchone()[0]
+            account_row = conn.execute(
+                "SELECT id FROM accounts WHERE username = ? AND password = ?",
+                (username, encrypted_password),
+            ).fetchone()
+            if account_row is None:
+                # 相同用户名但不同密码时，回退到按用户名匹配，避免导入中断
+                account_row = conn.execute(
+                    "SELECT id FROM accounts WHERE username = ?",
+                    (username,),
+                ).fetchone()
+            account_id = account_row[0]
 
             # site_accounts
             conn.execute(
@@ -411,7 +479,7 @@ class Importer:
                 (site_id, account_id, cookie, login_adapter, is_enabled)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (site_id, account_id, None, DEFAULT_ADAPTER, 1),
+                (site_id, account_id, cookie, DEFAULT_ADAPTER, 1),
             )
             site_account_id = conn.execute(
                 "SELECT id FROM site_accounts WHERE site_id = ? AND account_id = ?",
@@ -504,6 +572,64 @@ class Importer:
         except Exception as exc:
             return False, f"登录测试异常: {exc}"
 
+    @staticmethod
+    def _sanitize_cookie(value: str) -> Optional[str]:
+        """对 Cookie 字符串做轻量校验，保留浏览器 Cookie 原格式。"""
+        value = value.strip()
+        if not value:
+            return None
+        if len(value) > 8192:
+            raise ValidationError("cookie", "Cookie 长度不能超过 8192 字符")
+        if "\x00" in value:
+            raise ValidationError("cookie", "Cookie 包含非法空字符")
+        return value
+
+    def _validate_cookie(
+        self, base_url: str, username: str, cookie: str
+    ) -> Tuple[bool, str]:
+        """直接探测 Cookie 是否仍有效，并确认登录用户与预期一致。"""
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+            ),
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Referer": f"{base_url}/",
+            "X-Requested-With": "XMLHttpRequest",
+        })
+
+        for part in cookie.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if key and value:
+                session.cookies.set(key, value)
+
+        try:
+            resp = session.post(
+                f"{base_url}/wp-admin/admin-ajax.php",
+                data={"action": "get_current_user"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return False, f"探测接口返回非 200: {resp.status_code}"
+            data = resp.json()
+            if data.get("is_logged_in") is False:
+                return False, "Cookie 明确未登录"
+            if data.get("id", 0) <= 0 or not data.get("user_data"):
+                return False, "Cookie 未处于登录状态"
+            user_login = (data.get("user_data") or {}).get("user_login")
+            if user_login != username:
+                return False, f"Cookie 对应账号为 '{user_login}'，与 '{username}' 不一致"
+            return True, f"已登录用户: {user_login}"
+        except Exception as exc:
+            return False, f"Cookie 探测异常: {exc}"
+
     def _create_account_and_site_account(
         self,
         site_id: int,
@@ -521,7 +647,8 @@ class Importer:
             (username, encrypted_password),
         )
         account_id = conn.execute(
-            "SELECT id FROM accounts WHERE username = ?", (username,)
+            "SELECT id FROM accounts WHERE username = ? AND password = ?",
+            (username, encrypted_password),
         ).fetchone()[0]
 
         conn.execute(

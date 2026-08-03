@@ -67,25 +67,38 @@ class ZibllSliderLoginAdapter(BaseLoginAdapter):
             session.cookies.set(k, v)
         self.logger.debug("已从数据库加载 Cookie")
 
-    def _is_session_valid(self, session: requests.Session, base_url: str) -> bool:
+    def _is_session_valid(self, session: requests.Session, base_url: str, username: str) -> bool:
         """
-        检查当前 Session 是否已登录有效。
-        Zibll 主题提供 `action=get_current_user` 接口，登录后 id > 0 且 user_data 非空。
+        检查当前 Session 是否已登录有效，并确认登录用户与预期账号一致。
+
+        Zibll 主题提供 `action=get_current_user` 接口，登录后返回：
+        - is_logged_in 为 true
+        - id > 0
+        - user_data.user_login 与传入 username 一致
         """
         check_url = f"{base_url}/wp-admin/admin-ajax.php"
-        params = {"action": "get_current_user"}
+        payload = {"action": "get_current_user"}
         try:
-            resp = session.get(check_url, params=params, timeout=10)
+            resp = session.post(check_url, data=payload, timeout=10)
             if resp.status_code != 200:
                 self.logger.debug(f"Session 探测接口返回非 200: {resp.status_code}")
                 return False
             data = resp.json()
-            is_valid = data.get("id", 0) > 0 and bool(data.get("user_data"))
-            if is_valid:
-                self.logger.info(f"Session 有效: 用户ID={data.get('id')}")
-            else:
-                self.logger.debug(f"Session 无效: {data}")
-            return is_valid
+            # 兼容不同版本：优先使用 is_logged_in，不存在则回退到 id + user_data 判断
+            if data.get("is_logged_in") is False:
+                self.logger.debug(f"Session 明确未登录: {data}")
+                return False
+            if data.get("id", 0) <= 0 or not data.get("user_data"):
+                self.logger.debug(f"Session 未处于登录状态: {data}")
+                return False
+            user_login = (data.get("user_data") or {}).get("user_login")
+            if user_login != username:
+                self.logger.warning(
+                    f"Cookie 登录用户不匹配: cookie 对应 '{user_login}'，期望 '{username}'"
+                )
+                return False
+            self.logger.info(f"Session 有效: 用户 {user_login}")
+            return True
         except Exception as exc:
             self.logger.debug(f"Session 有效性检查失败: {exc}")
             return False
@@ -129,7 +142,10 @@ class ZibllSliderLoginAdapter(BaseLoginAdapter):
         """
         获取有效的已登录 Session。
 
-        若数据库中存在 Cookie，先探测其有效性；有效则直接复用，否则执行完整登录流程。
+        流程：
+        1. 若数据库中存在 Cookie，先探测其有效性；有效则直接复用。
+        2. Cookie 失效时，若存在密码则执行完整登录流程。
+        3. Cookie 失效且无密码时，直接返回 None，由调用方决定是否停用账号。
         """
         self.logger.info(
             f"开始登录 site_account_id={site_account_id}, url={base_url}, user={username}"
@@ -139,11 +155,18 @@ class ZibllSliderLoginAdapter(BaseLoginAdapter):
         if cookie:
             session = self._build_session(base_url)
             self._load_cookies(session, cookie)
-            if self._is_session_valid(session, base_url):
+            if self._is_session_valid(session, base_url, username):
                 self.logger.info("数据库 Cookie 仍有效，跳过登录")
                 self._update_last_used(site_account_id)
                 return session
             self.logger.info("数据库 Cookie 已失效，执行重新登录")
+
+        # 没有密码且 Cookie 失效，无法继续登录
+        if not password:
+            self.logger.warning(
+                f"site_account_id={site_account_id} 未设置密码且 Cookie 失效，无法登录"
+            )
+            return None
 
         # 2. 执行完整登录流程
         session = self._build_session(base_url)

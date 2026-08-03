@@ -7,7 +7,7 @@
 
 - **多账号 / 多站点管理**：账号与网站独立维护，通过关联表灵活组合。
 - **数据库驱动的登录适配器选择**：不同站点可配置不同的登录适配器，实现通用逻辑与特例逻辑分离。
-- **Session 复用与 Cookie 持久化**：运行前自动探测数据库中保存的 Cookie 是否有效，有效则跳过登录。
+- **Session 复用与 Cookie 持久化**：运行前自动探测数据库中保存的 Cookie 是否有效，有效则跳过登录；支持仅导入 Cookie、不导入密码的账号。
 - **环境检测与初次运行初始化**：启动时自动检查 Python 版本、依赖、项目文件完整性与数据库状态，辅助完成首次部署。
 - **任务级执行日志**：每次调度执行结果写入 `execution_logs` 表，便于追踪与去重。
 - **全局线程池**：基于 `concurrent.futures.ThreadPoolExecutor` 并发执行多个调度任务。
@@ -137,6 +137,14 @@ python main.py --import-account \
   --account-site https://example.com \
   --account-task daily_checkin \
   --schedule-type now
+
+# 非交互式仅导入 Cookie（不导入密码）
+python main.py --import-account \
+  --account-username your_username \
+  --account-cookie "wordpress_logged_in_xxx=...; PHPSESSID=..." \
+  --account-site https://example.com \
+  --account-task daily_checkin \
+  --schedule-type now
 ```
 
 ## 配置说明
@@ -162,7 +170,7 @@ initialization:
 核心表包括：
 
 - `websites`：目标站点信息；`url` 为第一域名，`aliases` 为 JSON 数组，存放同一站点的其他可访问域名
-- `accounts`：账号凭证（已加密存储）
+- `accounts`：账号凭证（已加密存储；仅使用 Cookie 的账号密码字段可为空）
 - `site_accounts`：站点与账号的关联配置，可指定登录适配器
 - `tasks`：业务任务定义（模块名、函数名）
 - `schedule_type`：`now` / `fixed` / `window` / `interval`
