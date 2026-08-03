@@ -1,8 +1,6 @@
-# config/settings.yaml
 logging:
-  level: "INFO"        # DEBUG, INFO, WARNING, ERROR
-  console: true        # 是否输出到终端
-  file: "logs/app.log"  # null 表示不写入文件
-
+  level: INFO
+  console: true
+  file: logs/app.log
 initialization:
-  status: "pending"  # "pending" 表示首次运行需执行环境检测与初始化；"initialized" 表示跳过检测
+  status: initialized

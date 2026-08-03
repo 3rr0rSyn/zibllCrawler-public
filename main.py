@@ -122,7 +122,12 @@ def execute_schedule(schedule: tuple, db_pool: SQLiteConnectionPool,
 
         if session is None:
             status = "failed"
-            result_message = "登录失败"
+            if not password:
+                result_message = "登录失败：账号未设置密码且 Cookie 失效，已停用该账号"
+                _disable_site_account(site_account_id, db_pool)
+                logger.warning(f"site_account_id={site_account_id} 无密码且 Cookie 失效，已停用")
+            else:
+                result_message = "登录失败"
         else:
             success, data = run_business(
                 session,
@@ -166,6 +171,17 @@ def execute_schedule(schedule: tuple, db_pool: SQLiteConnectionPool,
     )
 
     logger.info(f"调度 {schedule_id} 结束: status={status}, duration={duration_ms}ms")
+
+
+def _disable_site_account(site_account_id: int, db_pool: SQLiteConnectionPool) -> None:
+    """停用指定 site_account，防止无密码且 Cookie 失效的账号无限重试。"""
+    try:
+        conn = db_pool.get_connection()
+        conn.execute("UPDATE site_accounts SET is_enabled = 0 WHERE id = ?", (site_account_id,))
+        conn.commit()
+    except Exception as exc:
+        logger = setup_logger()
+        logger.error(f"停用 site_account_id={site_account_id} 失败: {exc}")
 
 
 def _is_network_error(exc: Exception) -> bool:
@@ -401,7 +417,8 @@ def main() -> None:
 
     # 导入账号参数
     parser.add_argument("--account-username", help="导入账号: 用户名")
-    parser.add_argument("--account-password", help="导入账号: 密码")
+    parser.add_argument("--account-password", help="导入账号: 密码（留空表示仅使用 Cookie）")
+    parser.add_argument("--account-cookie", help="导入账号: 浏览器 Cookie 字符串（留空表示使用密码登录）")
     parser.add_argument("--account-site", help="导入账号: 绑定网站 URL")
     parser.add_argument("--account-task", help="导入账号: 绑定任务名")
     parser.add_argument(
